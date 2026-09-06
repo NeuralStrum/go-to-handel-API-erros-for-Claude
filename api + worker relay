@@ -1,0 +1,1322 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"time"
+)
+
+const (
+	listenAddr      = "127.0.0.1:20218"
+	upstream        = "https://9router-production-b45b.up.railway.app"
+	outboundProxy   = "http://127.0.0.1:10808"
+	maxAttempts     = 3
+	firstEventTimeout = 20 * time.Minute
+	retryDelay      = 1 * time.Second
+	maxRetryDelay   = 8 * time.Second
+	maxBodyMB       = 50
+)
+
+type Config struct {
+	ListenAddr        string        `json:"listen_addr"`
+	Upstream          string        `json:"upstream"`
+	OutboundProxy     string        `json:"outbound_proxy"`
+	MaxAttempts       int           `json:"max_attempts"`
+	FirstEventTimeout time.Duration `json:"first_event_timeout"`
+	RetryDelay        time.Duration `json:"retry_delay"`
+	MaxRetryDelay     time.Duration `json:"max_retry_delay"`
+	MaxBodyMB         int64         `json:"max_body_mb"`
+}
+
+type Proxy struct {
+	config Config
+	client *http.Client
+}
+
+type AttemptResult struct {
+	StatusCode int
+	Header     http.Header
+	Body       []byte
+	Success    bool
+	Err        error
+	Reason     string
+}
+
+var (
+	enabled atomic.Bool
+	reqID   atomic.Uint64
+)
+
+func main() {
+	cfg := loadConfig()
+
+	enabled.Store(true)
+
+	proxy := &Proxy{
+		config: cfg,
+		client: newHTTPClient(cfg),
+	}
+
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/__proxy/health", proxy.health)
+	mux.HandleFunc("/__proxy/status", proxy.status)
+	mux.HandleFunc("/__proxy/enable", proxy.enable)
+	mux.HandleFunc("/__proxy/disable", proxy.disable)
+
+	mux.HandleFunc("/", proxy.handle)
+
+	server := &http.Server{
+		Addr:    cfg.ListenAddr,
+		Handler: mux,
+	}
+
+	log.Printf("==============================================")
+	log.Printf("API RELIABILITY PROXY")
+	log.Printf("==============================================")
+	log.Printf("listen:          %s", cfg.ListenAddr)
+	log.Printf("upstream:        %s", cfg.Upstream)
+	log.Printf("outbound proxy:  %s", cfg.OutboundProxy)
+	log.Printf("max attempts:    %d", cfg.MaxAttempts)
+	log.Printf("stream timeout:  %s", cfg.FirstEventTimeout)
+	log.Printf("retry delay:     %s", cfg.RetryDelay)
+	log.Printf("max retry delay: %s", cfg.MaxRetryDelay)
+	log.Printf("max body:        %d MB", cfg.MaxBodyMB)
+	log.Printf("enabled:         %v", enabled.Load())
+	log.Printf("==============================================")
+
+	if err := server.ListenAndServe(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func newHTTPClient(cfg Config) *http.Client {
+	transport := &http.Transport{
+		Proxy: nil,
+
+		ForceAttemptHTTP2: true,
+
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		MaxConnsPerHost:     100,
+		IdleConnTimeout:     90 * time.Second,
+
+		TLSHandshakeTimeout:   30 * time.Second,
+		ResponseHeaderTimeout: 0,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	if cfg.OutboundProxy != "" {
+		proxyURL, err := url.Parse(cfg.OutboundProxy)
+		if err != nil {
+			log.Printf("invalid outbound proxy %q: %v", cfg.OutboundProxy, err)
+		} else {
+			transport.Proxy = http.ProxyURL(proxyURL)
+		}
+	}
+
+	return &http.Client{
+		Transport: transport,
+
+		// IMPORTANT:
+		// Do not use a normal HTTP client timeout here.
+		// Streaming requests can legitimately remain open for a long time.
+		Timeout: 0,
+	}
+}
+
+func (p *Proxy) health(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	_, _ = io.WriteString(w, `{"status":"ok"}`)
+}
+
+func (p *Proxy) status(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	state := "disabled"
+	if enabled.Load() {
+		state = "enabled"
+	}
+
+	response := map[string]interface{}{
+		"enabled":           enabled.Load(),
+		"state":             state,
+		"listen_addr":       p.config.ListenAddr,
+		"upstream":          p.config.Upstream,
+		"outbound_proxy":    p.config.OutboundProxy,
+		"max_attempts":      p.config.MaxAttempts,
+		"stream_timeout":    p.config.FirstEventTimeout.String(),
+		"retry_delay":       p.config.RetryDelay.String(),
+		"max_retry_delay":   p.config.MaxRetryDelay.String(),
+		"max_body_mb":       p.config.MaxBodyMB,
+	}
+
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+func (p *Proxy) enable(w http.ResponseWriter, r *http.Request) {
+	enabled.Store(true)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	_, _ = io.WriteString(w, `{"enabled":true}`)
+}
+
+func (p *Proxy) disable(w http.ResponseWriter, r *http.Request) {
+	enabled.Store(false)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	_, _ = io.WriteString(w, `{"enabled":false}`)
+}
+
+func (p *Proxy) handle(w http.ResponseWriter, r *http.Request) {
+	id := reqID.Add(1)
+
+	log.Printf("[REQ %d] %s %s", id, r.Method, r.URL.RequestURI())
+
+	if strings.HasPrefix(r.URL.Path, "/__proxy/") {
+		http.NotFound(w, r)
+		return
+	}
+
+	maxBytes := p.config.MaxBodyMB * 1024 * 1024
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBytes+1))
+	if err != nil {
+		log.Printf("[REQ %d] failed reading request body: %v", id, err)
+
+		http.Error(w, "failed reading request body", http.StatusBadRequest)
+		return
+	}
+
+	if int64(len(body)) > maxBytes {
+		log.Printf("[REQ %d] request body exceeds %d MB", id, p.config.MaxBodyMB)
+
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	log.Printf("[REQ %d] request body bytes: %d", id, len(body))
+
+	streaming := isStreamingRequest(body)
+
+	if streaming {
+		log.Printf("[REQ %d] detected STREAMING request", id)
+	} else {
+		log.Printf("[REQ %d] detected NON-STREAMING request", id)
+	}
+
+	if !enabled.Load() {
+		log.Printf("[REQ %d] reliability mode disabled", id)
+
+		result := p.attempt(r.Context(), r, body, streaming, id, 1)
+
+		if result.Err != nil {
+			log.Printf("[REQ %d] attempt error: %v", id, result.Err)
+			http.Error(w, result.Err.Error(), http.StatusBadGateway)
+			return
+		}
+
+		result.writeTo(w)
+		return
+	}
+
+	result := p.forwardWithRetry(r.Context(), r, body, streaming, id)
+
+	if result.Err != nil && !result.Success {
+		log.Printf("[REQ %d] all attempts failed: %v", id, result.Err)
+
+		http.Error(w, result.Err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	result.writeTo(w)
+}
+
+func isStreamingRequest(body []byte) bool {
+	var payload struct {
+		Stream bool `json:"stream"`
+	}
+
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return false
+	}
+
+	return payload.Stream
+}
+
+func (p *Proxy) forwardWithRetry(
+	ctx context.Context,
+	r *http.Request,
+	body []byte,
+	streaming bool,
+	id uint64,
+) AttemptResult {
+	var last AttemptResult
+
+	delay := p.config.RetryDelay
+
+	for attempt := 1; attempt <= p.config.MaxAttempts; attempt++ {
+		log.Printf(
+			"[REQ %d] ATTEMPT %d/%d",
+			id,
+			attempt,
+			p.config.MaxAttempts,
+		)
+
+		result := p.attempt(
+			ctx,
+			r,
+			body,
+			streaming,
+			id,
+			attempt,
+		)
+
+		if result.Success {
+			log.Printf(
+				"[REQ %d] ATTEMPT %d SUCCESS",
+				id,
+				attempt,
+			)
+
+			return result
+		}
+
+		last = result
+
+		if result.Err != nil {
+			log.Printf(
+				"[REQ %d] attempt error: %v",
+				id,
+				result.Err,
+			)
+		}
+
+		if result.Reason != "" {
+			log.Printf(
+				"[REQ %d] RETRY REASON: %s",
+				id,
+				result.Reason,
+			)
+		}
+
+		if attempt == p.config.MaxAttempts {
+			break
+		}
+
+		select {
+		case <-ctx.Done():
+			log.Printf(
+				"[REQ %d] client disconnected during retry delay",
+				id,
+			)
+
+			return AttemptResult{
+				Err:    ctx.Err(),
+				Reason: "client_disconnected",
+			}
+
+		case <-time.After(delay):
+		}
+
+		log.Printf(
+			"[REQ %d] retrying in %s",
+			id,
+			delay,
+		)
+
+		delay *= 2
+		if delay > p.config.MaxRetryDelay {
+			delay = p.config.MaxRetryDelay
+		}
+	}
+
+	if last.Err == nil {
+		last.Err = errors.New("all upstream attempts failed")
+	}
+
+	return last
+}
+
+func (p *Proxy) attempt(
+	ctx context.Context,
+	r *http.Request,
+	body []byte,
+	streaming bool,
+	id uint64,
+	attemptNumber int,
+) AttemptResult {
+	upstreamURL := strings.TrimRight(p.config.Upstream, "/") + r.URL.Path
+
+	if r.URL.RawQuery != "" {
+		upstreamURL += "?" + r.URL.RawQuery
+	}
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		r.Method,
+		upstreamURL,
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		return AttemptResult{
+			Err:    err,
+			Reason: "request_creation_error",
+		}
+	}
+
+	copyRequestHeaders(req.Header, r.Header)
+
+	// Streaming must not be compressed.
+	// This ensures the proxy receives the actual SSE stream.
+	req.Header.Set("Accept-Encoding", "identity")
+
+	parsedUpstream, err := url.Parse(p.config.Upstream)
+	if err == nil && parsedUpstream.Host != "" {
+		req.Host = parsedUpstream.Host
+	}
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return AttemptResult{
+			Err:    err,
+			Reason: "transport_error",
+		}
+	}
+
+	defer resp.Body.Close()
+
+	if streaming {
+		return p.handleStreamingResponse(
+			resp,
+			id,
+			attemptNumber,
+		)
+	}
+
+	return p.handleNormalResponse(
+		resp,
+		id,
+		attemptNumber,
+	)
+}
+
+func (p *Proxy) handleNormalResponse(
+	resp *http.Response,
+	id uint64,
+	attemptNumber int,
+) AttemptResult {
+	maxBytes := p.config.MaxBodyMB * 1024 * 1024
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil {
+		return AttemptResult{
+			StatusCode: resp.StatusCode,
+			Header:     cloneHeader(resp.Header),
+			Err:        err,
+			Reason:     "response_read_error",
+		}
+	}
+
+	if int64(len(body)) > maxBytes {
+		return AttemptResult{
+			StatusCode: resp.StatusCode,
+			Header:     cloneHeader(resp.Header),
+			Err:        errors.New("upstream response exceeds maximum body size"),
+			Reason:     "response_too_large",
+		}
+	}
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if len(bytes.TrimSpace(body)) == 0 {
+			return AttemptResult{
+				StatusCode: resp.StatusCode,
+				Header:     cloneHeader(resp.Header),
+				Err:        errors.New("upstream returned empty successful response"),
+				Reason:     "empty_response",
+			}
+		}
+
+		contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+
+		if strings.Contains(contentType, "json") {
+			if !validateOpenAIResponse(body) {
+				return AttemptResult{
+					StatusCode: resp.StatusCode,
+					Header:     cloneHeader(resp.Header),
+					Err:        errors.New("upstream returned malformed or empty JSON response"),
+					Reason:     "invalid_json_response",
+				}
+			}
+		}
+
+		return AttemptResult{
+			StatusCode: resp.StatusCode,
+			Header:     cloneHeader(resp.Header),
+			Body:       body,
+			Success:    true,
+		}
+	}
+
+	if isRetryableStatus(resp.StatusCode) {
+		return AttemptResult{
+			StatusCode: resp.StatusCode,
+			Header:     cloneHeader(resp.Header),
+			Body:       body,
+			Err:        fmt.Errorf("upstream returned retryable HTTP status %d", resp.StatusCode),
+			Reason:     fmt.Sprintf("http_%d", resp.StatusCode),
+		}
+	}
+
+	return AttemptResult{
+		StatusCode: resp.StatusCode,
+		Header:     cloneHeader(resp.Header),
+		Body:       body,
+		Success:    true,
+	}
+}
+
+func (p *Proxy) handleStreamingResponse(
+	resp *http.Response,
+	id uint64,
+	attemptNumber int,
+) AttemptResult {
+	if isRetryableStatus(resp.StatusCode) {
+		body, _ := io.ReadAll(io.LimitReader(
+			resp.Body,
+			p.config.MaxBodyMB*1024*1024,
+		))
+
+		return AttemptResult{
+			StatusCode: resp.StatusCode,
+			Header:     cloneHeader(resp.Header),
+			Body:       body,
+			Err:        fmt.Errorf(
+				"upstream returned retryable HTTP status %d",
+				resp.StatusCode,
+			),
+			Reason: fmt.Sprintf("http_%d", resp.StatusCode),
+		}
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(
+			resp.Body,
+			p.config.MaxBodyMB*1024*1024,
+		))
+
+		return AttemptResult{
+			StatusCode: resp.StatusCode,
+			Header:     cloneHeader(resp.Header),
+			Body:       body,
+			Success:    true,
+		}
+	}
+
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+
+	// Some upstreams may return a normal JSON response even when
+	// stream=true was requested.
+	if !strings.Contains(contentType, "text/event-stream") {
+		body, err := io.ReadAll(io.LimitReader(
+			resp.Body,
+			p.config.MaxBodyMB*1024*1024+1,
+		))
+
+		if err != nil {
+			return AttemptResult{
+				StatusCode: resp.StatusCode,
+				Header:     cloneHeader(resp.Header),
+				Err:        err,
+				Reason:     "stream_response_read_error",
+			}
+		}
+
+		if int64(len(body)) > p.config.MaxBodyMB*1024*1024 {
+			return AttemptResult{
+				StatusCode: resp.StatusCode,
+				Header:     cloneHeader(resp.Header),
+				Err:        errors.New("upstream response exceeds maximum body size"),
+				Reason:     "response_too_large",
+			}
+		}
+
+		if len(bytes.TrimSpace(body)) == 0 {
+			return AttemptResult{
+				StatusCode: resp.StatusCode,
+				Header:     cloneHeader(resp.Header),
+				Err:        errors.New("upstream returned empty streaming response"),
+				Reason:     "empty_stream_response",
+			}
+		}
+
+		if !validateOpenAIResponse(body) {
+			return AttemptResult{
+				StatusCode: resp.StatusCode,
+				Header:     cloneHeader(resp.Header),
+				Err:        errors.New("upstream returned malformed streaming JSON response"),
+				Reason:     "invalid_stream_json_response",
+			}
+		}
+
+		return AttemptResult{
+			StatusCode: resp.StatusCode,
+			Header:     cloneHeader(resp.Header),
+			Body:       body,
+			Success:    true,
+		}
+	}
+
+	log.Printf(
+		"[REQ %d] ATTEMPT %d received SSE stream",
+		id,
+		attemptNumber,
+	)
+
+	return p.readAndValidateSSE(
+		resp,
+		id,
+		attemptNumber,
+	)
+}
+
+type streamReadResult struct {
+	data []byte
+	err  error
+	done bool
+}
+
+func (p *Proxy) readAndValidateSSE(
+	resp *http.Response,
+	id uint64,
+	attemptNumber int,
+) AttemptResult {
+	reader := bufio.NewReader(resp.Body)
+
+	results := make(chan streamReadResult, 1)
+	stop := make(chan struct{})
+
+	go func() {
+		defer func() {
+			select {
+			case results <- streamReadResult{done: true}:
+			case <-stop:
+			}
+		}()
+
+		for {
+			event, err := readSSEEvent(reader)
+
+			if len(event) > 0 {
+				select {
+				case results <- streamReadResult{
+					data: event,
+				}:
+				case <-stop:
+					return
+				}
+			}
+
+			if err != nil {
+				select {
+				case results <- streamReadResult{
+					err: err,
+				}:
+				case <-stop:
+				}
+				return
+			}
+		}
+	}()
+
+	defer close(stop)
+
+	var output bytes.Buffer
+
+	maxBytes := p.config.MaxBodyMB * 1024 * 1024
+
+	timer := time.NewTimer(p.config.FirstEventTimeout)
+	defer timer.Stop()
+
+	seenMeaningful := false
+	complete := false
+
+	for {
+		select {
+		case <-timer.C:
+			_ = resp.Body.Close()
+
+			log.Printf(
+				"[REQ %d] ATTEMPT %d stream idle timeout after %s",
+				id,
+				attemptNumber,
+				p.config.FirstEventTimeout,
+			)
+
+			return AttemptResult{
+				StatusCode: resp.StatusCode,
+				Header:     cloneHeader(resp.Header),
+				Err: fmt.Errorf(
+					"upstream SSE stream timed out after %s",
+					p.config.FirstEventTimeout,
+				),
+				Reason: "sse_stream_timeout",
+			}
+
+		case result := <-results:
+			if len(result.data) > 0 {
+				if int64(output.Len()+len(result.data)) > int64(maxBytes) {
+					_ = resp.Body.Close()
+
+					return AttemptResult{
+						StatusCode: resp.StatusCode,
+						Header:     cloneHeader(resp.Header),
+						Err: errors.New(
+							"upstream SSE stream exceeds maximum body size",
+						),
+						Reason: "sse_response_too_large",
+					}
+				}
+
+				// IMPORTANT:
+				// Every SSE event is appended.
+				// Nothing before the first meaningful event is discarded.
+				_, _ = output.Write(result.data)
+
+				if isMeaningfulSSEEvent(result.data) {
+					seenMeaningful = true
+				}
+
+				if isTerminalSSEEvent(result.data) {
+					complete = true
+				}
+
+				// Any received SSE event/data means the connection
+				// is alive. Reset the 20-minute idle timer.
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+
+				timer.Reset(p.config.FirstEventTimeout)
+
+				continue
+			}
+
+			if result.err != nil {
+				// EOF is only successful if we previously received
+				// the explicit terminal event.
+				if errors.Is(result.err, io.EOF) {
+					if complete {
+						if !seenMeaningful {
+							return AttemptResult{
+								StatusCode: resp.StatusCode,
+								Header:     cloneHeader(resp.Header),
+								Err: errors.New(
+									"upstream SSE completed without meaningful content",
+								),
+								Reason: "sse_no_meaningful_content",
+							}
+						}
+
+						log.Printf(
+							"[REQ %d] ATTEMPT %d SSE COMPLETE",
+							id,
+							attemptNumber,
+						)
+
+						return AttemptResult{
+							StatusCode: resp.StatusCode,
+							Header:     cloneHeader(resp.Header),
+							Body:       output.Bytes(),
+							Success:    true,
+						}
+					}
+
+					return AttemptResult{
+						StatusCode: resp.StatusCode,
+						Header:     cloneHeader(resp.Header),
+						Err: errors.New(
+							"upstream SSE stream ended before terminal event",
+						),
+						Reason: "sse_incomplete_eof",
+					}
+				}
+
+				return AttemptResult{
+					StatusCode: resp.StatusCode,
+					Header:     cloneHeader(resp.Header),
+					Err:        result.err,
+					Reason:     "sse_stream_read_error",
+				}
+			}
+
+			if result.done {
+				if complete {
+					if !seenMeaningful {
+						return AttemptResult{
+							StatusCode: resp.StatusCode,
+							Header:     cloneHeader(resp.Header),
+							Err: errors.New(
+								"upstream SSE completed without meaningful content",
+							),
+							Reason: "sse_no_meaningful_content",
+						}
+					}
+
+					return AttemptResult{
+						StatusCode: resp.StatusCode,
+						Header:     cloneHeader(resp.Header),
+						Body:       output.Bytes(),
+						Success:    true,
+					}
+				}
+
+				return AttemptResult{
+					StatusCode: resp.StatusCode,
+					Header:     cloneHeader(resp.Header),
+					Err: errors.New(
+						"upstream SSE reader ended without terminal event",
+					),
+					Reason: "sse_incomplete",
+				}
+			}
+		}
+	}
+}
+
+func readSSEEvent(reader *bufio.Reader) ([]byte, error) {
+	var event bytes.Buffer
+
+	for {
+		line, err := reader.ReadBytes('\n')
+
+		if len(line) > 0 {
+			_, _ = event.Write(line)
+		}
+
+		if err != nil {
+			if len(event.Bytes()) > 0 {
+				return event.Bytes(), err
+			}
+
+			return nil, err
+		}
+
+		// SSE events are terminated by a blank line.
+		if len(line) == 1 && line[0] == '\n' {
+			return event.Bytes(), nil
+		}
+
+		if len(line) == 2 && line[0] == '\r' && line[1] == '\n' {
+			return event.Bytes(), nil
+		}
+	}
+}
+
+func isTerminalSSEEvent(event []byte) bool {
+	text := string(event)
+
+	// OpenAI-compatible SSE termination.
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+
+		if line == "data: [DONE]" ||
+			line == "data:[DONE]" ||
+			line == "[DONE]" {
+			return true
+		}
+	}
+
+	// Anthropic-style event termination.
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+
+		if strings.HasPrefix(line, "event:") {
+			eventName := strings.TrimSpace(
+				strings.TrimPrefix(line, "event:"),
+			)
+
+			if eventName == "message_stop" {
+				return true
+			}
+		}
+	}
+
+	// Some SSE implementations put the event type only
+	// inside the JSON data payload.
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+
+		data := strings.TrimSpace(
+			strings.TrimPrefix(line, "data:"),
+		)
+
+		if data == "" || data == "[DONE]" {
+			if data == "[DONE]" {
+				return true
+			}
+			continue
+		}
+
+		var payload map[string]interface{}
+
+		if json.Unmarshal([]byte(data), &payload) != nil {
+			continue
+		}
+
+		if eventType, ok := payload["type"].(string); ok {
+			if eventType == "message_stop" {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func isMeaningfulSSEEvent(event []byte) bool {
+	text := string(event)
+
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+
+		data := strings.TrimSpace(
+			strings.TrimPrefix(line, "data:"),
+		)
+
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+
+		var payload map[string]interface{}
+
+		if err := json.Unmarshal([]byte(data), &payload); err != nil {
+			// Preserve compatibility with SSE providers that send
+			// non-JSON data payloads.
+			return true
+		}
+
+		// Anthropic Messages API.
+		if eventType, ok := payload["type"].(string); ok {
+			switch eventType {
+			case "ping":
+				return false
+
+			case "message_start":
+				// Protocol metadata, not generated content.
+				continue
+
+			case "content_block_start":
+				return true
+
+			case "content_block_delta":
+				return true
+
+			case "message_delta":
+				// May contain stop_reason/usage but no generated text.
+				if delta, ok := payload["delta"].(map[string]interface{}); ok {
+					if _, exists := delta["stop_reason"]; exists {
+						continue
+					}
+				}
+
+				continue
+
+			case "content_block_stop":
+				continue
+
+			case "message_stop":
+				continue
+
+			default:
+				return true
+			}
+		}
+
+		// OpenAI-compatible response.
+		if choices, ok := payload["choices"].([]interface{}); ok {
+			if len(choices) == 0 {
+				continue
+			}
+
+			choice, ok := choices[0].(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			if delta, ok := choice["delta"].(map[string]interface{}); ok {
+				if content, ok := delta["content"].(string); ok && content != "" {
+					return true
+				}
+
+				if toolCalls, ok := delta["tool_calls"]; ok && toolCalls != nil {
+					return true
+				}
+
+				if functionCall, ok := delta["function_call"]; ok && functionCall != nil {
+					return true
+				}
+			}
+
+			if message, ok := choice["message"].(map[string]interface{}); ok {
+				if content, ok := message["content"].(string); ok && content != "" {
+					return true
+				}
+
+				if toolCalls, ok := message["tool_calls"]; ok && toolCalls != nil {
+					return true
+				}
+
+				if functionCall, ok := message["function_call"]; ok && functionCall != nil {
+					return true
+				}
+			}
+
+			if textValue, ok := choice["text"].(string); ok && textValue != "" {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	return false
+}
+
+func validateOpenAIResponse(body []byte) bool {
+	var payload map[string]interface{}
+
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return false
+	}
+
+	// Anthropic Messages responses do not contain "choices".
+	// If this is a valid JSON object without choices, accept it.
+	choicesValue, exists := payload["choices"]
+
+	if !exists {
+		return true
+	}
+
+	choices, ok := choicesValue.([]interface{})
+	if !ok || len(choices) == 0 {
+		return false
+	}
+
+	choice, ok := choices[0].(map[string]interface{})
+	if !ok {
+		return false
+	}
+
+	if message, ok := choice["message"].(map[string]interface{}); ok {
+		if content, ok := message["content"].(string); ok && content != "" {
+			return true
+		}
+
+		if content, ok := message["content"].([]interface{}); ok && len(content) > 0 {
+			return true
+		}
+
+		if toolCalls, ok := message["tool_calls"]; ok && toolCalls != nil {
+			return true
+		}
+
+		if functionCall, ok := message["function_call"]; ok && functionCall != nil {
+			return true
+		}
+	}
+
+	if textValue, ok := choice["text"].(string); ok && textValue != "" {
+		return true
+	}
+
+	if delta, ok := choice["delta"].(map[string]interface{}); ok {
+		if content, ok := delta["content"].(string); ok && content != "" {
+			return true
+		}
+
+		if toolCalls, ok := delta["tool_calls"]; ok && toolCalls != nil {
+			return true
+		}
+
+		if functionCall, ok := delta["function_call"]; ok && functionCall != nil {
+			return true
+		}
+	}
+
+	return false
+}
+
+func isRetryableStatus(status int) bool {
+	switch status {
+	case http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+
+	default:
+		return false
+	}
+}
+
+func copyRequestHeaders(dst, src http.Header) {
+	for key, values := range src {
+		if isHopByHopHeader(key) {
+			continue
+		}
+
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+}
+
+func copyResponseHeaders(dst, src http.Header) {
+	for key, values := range src {
+		if isHopByHopHeader(key) {
+			continue
+		}
+
+		// Because the response has been completely buffered,
+		// do not forward an upstream Content-Length blindly.
+		if strings.EqualFold(key, "Content-Length") {
+			continue
+		}
+
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+}
+
+func cloneHeader(src http.Header) http.Header {
+	dst := make(http.Header, len(src))
+
+	for key, values := range src {
+		dst[key] = append([]string(nil), values...)
+	}
+
+	return dst
+}
+
+func isHopByHopHeader(key string) bool {
+	switch strings.ToLower(key) {
+	case "connection",
+		"proxy-connection",
+		"keep-alive",
+		"transfer-encoding",
+		"upgrade",
+		"te",
+		"trailer",
+		"host",
+		"content-length",
+		"accept-encoding":
+		return true
+
+	default:
+		return false
+	}
+}
+
+func (r AttemptResult) writeTo(w http.ResponseWriter) {
+	copyResponseHeaders(w.Header(), r.Header)
+
+	if r.StatusCode == 0 {
+		r.StatusCode = http.StatusBadGateway
+	}
+
+	// The body is fully buffered before reaching this point.
+	// Setting the exact Content-Length prevents the downstream
+	// client from receiving an incomplete/chunk-mismatched body.
+	w.Header().Set(
+		"Content-Length",
+		strconv.Itoa(len(r.Body)),
+	)
+
+	w.WriteHeader(r.StatusCode)
+
+	if len(r.Body) > 0 {
+		_, _ = w.Write(r.Body)
+	}
+}
+
+func loadConfig() Config {
+	cfg := Config{
+		ListenAddr:        listenAddr,
+		Upstream:          upstream,
+		OutboundProxy:     outboundProxy,
+		MaxAttempts:       maxAttempts,
+		FirstEventTimeout: firstEventTimeout,
+		RetryDelay:        retryDelay,
+		MaxRetryDelay:     maxRetryDelay,
+		MaxBodyMB:         maxBodyMB,
+	}
+
+	// Optional JSON configuration file.
+	if path := os.Getenv("RELIABILITY_PROXY_CONFIG"); path != "" {
+		data, err := os.ReadFile(path)
+
+		if err != nil {
+			log.Printf(
+				"failed reading config file %q: %v",
+				path,
+				err,
+			)
+		} else {
+			var fileCfg struct {
+				ListenAddr        string `json:"listen_addr"`
+				Upstream          string `json:"upstream"`
+				OutboundProxy     string `json:"outbound_proxy"`
+				MaxAttempts       int    `json:"max_attempts"`
+				FirstEventTimeout string `json:"first_event_timeout"`
+				RetryDelay        string `json:"retry_delay"`
+				MaxRetryDelay     string `json:"max_retry_delay"`
+				MaxBodyMB         int64  `json:"max_body_mb"`
+			}
+
+			if err := json.Unmarshal(data, &fileCfg); err != nil {
+				log.Printf(
+					"failed parsing config file %q: %v",
+					path,
+					err,
+				)
+			} else {
+				if fileCfg.ListenAddr != "" {
+					cfg.ListenAddr = fileCfg.ListenAddr
+				}
+
+				if fileCfg.Upstream != "" {
+					cfg.Upstream = fileCfg.Upstream
+				}
+
+				if fileCfg.OutboundProxy != "" {
+					cfg.OutboundProxy = fileCfg.OutboundProxy
+				}
+
+				if fileCfg.MaxAttempts > 0 {
+					cfg.MaxAttempts = fileCfg.MaxAttempts
+				}
+
+				if fileCfg.FirstEventTimeout != "" {
+					if duration, err := time.ParseDuration(
+						fileCfg.FirstEventTimeout,
+					); err == nil {
+						cfg.FirstEventTimeout = duration
+					} else {
+						log.Printf(
+							"invalid first_event_timeout: %v",
+							err,
+						)
+					}
+				}
+
+				if fileCfg.RetryDelay != "" {
+					if duration, err := time.ParseDuration(
+						fileCfg.RetryDelay,
+					); err == nil {
+						cfg.RetryDelay = duration
+					} else {
+						log.Printf(
+							"invalid retry_delay: %v",
+							err,
+						)
+					}
+				}
+
+				if fileCfg.MaxRetryDelay != "" {
+					if duration, err := time.ParseDuration(
+						fileCfg.MaxRetryDelay,
+					); err == nil {
+						cfg.MaxRetryDelay = duration
+					} else {
+						log.Printf(
+							"invalid max_retry_delay: %v",
+							err,
+						)
+					}
+				}
+
+				if fileCfg.MaxBodyMB > 0 {
+					cfg.MaxBodyMB = fileCfg.MaxBodyMB
+				}
+			}
+		}
+	}
+
+	// Environment overrides.
+	if value := os.Getenv("RELIABILITY_PROXY_LISTEN_ADDR"); value != "" {
+		cfg.ListenAddr = value
+	}
+
+	if value := os.Getenv("RELIABILITY_PROXY_UPSTREAM"); value != "" {
+		cfg.Upstream = value
+	}
+
+	if value := os.Getenv("RELIABILITY_PROXY_OUTBOUND_PROXY"); value != "" {
+		cfg.OutboundProxy = value
+	}
+
+	if value := os.Getenv("RELIABILITY_PROXY_MAX_ATTEMPTS"); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil && parsed > 0 {
+			cfg.MaxAttempts = parsed
+		}
+	}
+
+	if value := os.Getenv("RELIABILITY_PROXY_FIRST_EVENT_TIMEOUT"); value != "" {
+		if parsed, err := time.ParseDuration(value); err == nil {
+			cfg.FirstEventTimeout = parsed
+		}
+	}
+
+	if value := os.Getenv("RELIABILITY_PROXY_RETRY_DELAY"); value != "" {
+		if parsed, err := time.ParseDuration(value); err == nil {
+			cfg.RetryDelay = parsed
+		}
+	}
+
+	if value := os.Getenv("RELIABILITY_PROXY_MAX_RETRY_DELAY"); value != "" {
+		if parsed, err := time.ParseDuration(value); err == nil {
+			cfg.MaxRetryDelay = parsed
+		}
+	}
+
+	if value := os.Getenv("RELIABILITY_PROXY_MAX_BODY_MB"); value != "" {
+		if parsed, err := strconv.ParseInt(value, 10, 64); err == nil && parsed > 0 {
+			cfg.MaxBodyMB = parsed
+		}
+	}
+
+	return cfg
+}
